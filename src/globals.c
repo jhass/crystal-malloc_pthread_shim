@@ -1,0 +1,1 @@
+__thread int _inside_gc = 0;

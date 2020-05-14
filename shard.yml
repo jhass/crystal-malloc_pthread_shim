@@ -1,0 +1,12 @@
+name: malloc_pthread_shim
+version: 0.1.0
+
+authors:
+  - Jonne Haß <jonne.hass@offerista.com>
+
+crystal: 0.34.0
+
+license: MIT
+
+scripts:
+  postinstall: make
