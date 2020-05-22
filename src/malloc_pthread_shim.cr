@@ -19,6 +19,14 @@ lib LibGC
 
   @[ThreadLocal]
   $_inside_gc : LibC::Int
+  @[ThreadLocal]
+  $_alignment_table : Void*
+
+  struct AlignmentTableEntry
+    next_entry : AlignmentTableEntry*
+    ptr : Void*
+    original_ptr : Void*
+  end
 end
 
 lib LibC
@@ -91,6 +99,54 @@ fun calloc(count : LibC::SizeT, size : LibC::SizeT) : Void*
   malloc(count * size)
 end
 
+module GC
+  def self.alignment_table
+    if LibGC._alignment_table.null?
+      LibGC._alignment_table = Pointer(AlignmentTable).malloc.as(Void*)
+      LibGC._alignment_table.as(AlignmentTable*).value.initialize
+    end
+
+    LibGC._alignment_table.as(AlignmentTable*).value
+  end
+
+  struct AlignmentTable
+    def initialize
+      @head = Pointer(LibGC::AlignmentTableEntry).null
+    end
+
+    def record(ptr : Void*, original_ptr : Void*)
+      entry_ptr = Pointer(LibGC::AlignmentTableEntry).malloc
+      entry = entry_ptr.value
+      entry.next_entry = @head
+      entry.ptr = ptr
+      entry.original_ptr = original_ptr
+      @head = entry_ptr
+      nil
+    end
+
+    def find_original(ptr)
+      entry = @head
+      previous = nil
+      until entry.null?
+        if entry.value.ptr == ptr
+          if previous
+            previous.value.next_entry = entry.value.next_entry
+          else
+            @head = entry.value.next_entry
+          end
+
+          return entry.value.original_ptr
+        end
+
+        previous = entry
+        entry = entry.value.next_entry
+      end
+
+      ptr
+    end
+  end
+end
+
 fun free(ptr : Void*)
   # We potentially leak some memory here in case our malloc wrapper couldn't
   # wait for the GC to be initialized and had pass it to the original system malloc,
@@ -100,6 +156,7 @@ fun free(ptr : Void*)
   # such as pthread_*. We just hope that's little enough memory.
 
   if gc_initialized?
+    ptr = GC.alignment_table.find_original(ptr) unless inside_gc?
     GC.is_heap_ptr(ptr) ? enter_gc { LibGC.free(ptr) } : LibC.real_free(ptr)
   end
 end
@@ -117,6 +174,7 @@ private def correct_alignment(alignment : LibC::SizeT, size : LibC::SizeT)
   return {alignment, size, LibC::SizeT.new(0)} if alignment <= hlbocksize
 
   offset = alignment - hlbocksize
+
   {hlbocksize, size + offset, offset}
 end
 
@@ -126,7 +184,11 @@ fun memalign(alignment : LibC::SizeT, size : LibC::SizeT) : Void*
   gc_alignment, size, offset = correct_alignment(alignment, size)
 
   ptr = enter_gc { LibGC.memalign(gc_alignment, size) }
-  ptr += offset unless ptr.null? || (ptr.address // alignment) * alignment == ptr.address
+  unless ptr.null? || (ptr.address // alignment) * alignment == ptr.address
+    original_ptr = ptr
+    ptr += offset
+    GC.alignment_table.record(ptr, original_ptr)
+  end
   ptr
 end
 
@@ -136,7 +198,11 @@ fun posix_memalign(ptr : Void**, alignment : LibC::SizeT, size : LibC::SizeT) : 
   gc_alignment, size, offset = correct_alignment alignment, size
 
   ret = enter_gc { LibGC.posix_memalign(ptr, gc_alignment, size) }
-  ptr.value = ptr.value + offset unless ret != 0 || ptr.value.null? || (ptr.value.address // alignment) * alignment == ptr.value.address
+  unless ret != 0 || ptr.value.null? || (ptr.value.address // alignment) * alignment == ptr.value.address
+    original_ptr = ptr.value
+    ptr.value = ptr.value + offset
+    GC.alignment_table.record(ptr.value, original_ptr)
+  end
   ret
 end
 
